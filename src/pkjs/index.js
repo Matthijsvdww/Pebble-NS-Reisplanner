@@ -536,4 +536,4 @@ Pebble.addEventListener('ready', function () {
     setPoll(POLL_WAIT_MS);
     fetchList();
   }
-});
+}
