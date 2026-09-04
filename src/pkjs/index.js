@@ -257,6 +257,7 @@ function buildLines(trip, now) {
       var wc = legWarnCode(leg, legs[i + 1]);
       if (wc) lines.push(warnText(wc));
     }
+  }
   if (typeof trip.punctuality === 'number') {
     lines.push('Punctualiteit: ' + Math.round(trip.punctuality) + '%');
   }
@@ -536,4 +537,4 @@ Pebble.addEventListener('ready', function () {
     setPoll(POLL_WAIT_MS);
     fetchList();
   }
-}
+});
