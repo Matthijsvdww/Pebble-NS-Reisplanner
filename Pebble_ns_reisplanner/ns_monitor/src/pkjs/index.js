@@ -254,9 +254,11 @@ function buildLines(trip, now) {
       var dep = nsMs(legs[i + 1].origin.actualDateTime || legs[i + 1].origin.plannedDateTime);
       var wait = (arr && dep) ? Math.round((dep - arr) / 60000) : 0;
       lines.push(transferRow(wait < 0 ? 0 : wait));
-      var w = warnRow(leg, legs[i + 1]);
-      if (w) lines.push(w);
+      var wc = legWarnCode(leg, legs[i + 1]);
+      if (wc) lines.push(warnText(wc));
     }
+  if (typeof trip.punctuality === 'number') {
+    lines.push('Punctualiteit: ' + Math.round(trip.punctuality) + '%');
   }
   return lines;
 }
@@ -291,15 +293,30 @@ function buildHead(trip, now, ride) {
                  (tr ? ' [' + tr + ']' : ''),
            style: (d > 0 || trackChange(next)) ? 1 : 0 };
 }
-function warnRow(leg, nextLeg) {
-  if (leg.cancelled) return '!! Trein geannuleerd';
-  if (leg.partCancelled) return '!! Trein deels geannuleerd';
-  if (!nextLeg) return '';
-  if (nextLeg.cancelled) return '!! Verbinding geannuleerd';
-  if (nextLeg.changePossible === false) return '!! Overstap kansloos';
-  if (!nextLeg.reachable) return '!! Overstap niet haalbaar';
-  if (nextLeg.partCancelled) return '!! Volgende trein deels geannuleerd';
-  return '';
+function legWarnCode(leg, nxt) {
+  if (leg.cancelled) return 1;
+  if (leg.partCancelled) return 2;
+  if (nxt) {
+    if (nxt.cancelled) return 1;
+    if (nxt.changePossible === false) return 3;
+    if (nxt.reachable === false) return 4;
+    if (nxt.partCancelled) return 2;
+  }
+  return 0;
+}
+function warnText(code) {
+  return code === 1 ? '!! Trein geannuleerd' :
+         code === 2 ? '!! Trein deels geannuleerd' :
+         code === 3 ? '!! Overstap kansloos' :
+         code === 4 ? '!! Overstap niet haalbaar' : '';
+}
+function tripWarnCode(trip) {
+  var legs = trip.legs || [];
+  for (var i = 0; i < legs.length; i++) {
+    var c = legWarnCode(legs[i], legs[i + 1]);
+    if (c) return c;
+  }
+  return 0;
 }
 function sendCard(trip, ride) {
   try {
@@ -312,6 +329,7 @@ function sendCard(trip, ride) {
       'RouteLabel': activeRoute().label,
       'Head': head.text,
       'HeadStyle': head.style,
+      'WarnCode': tripWarnCode(trip),
       'Timeline': tl,
       'Updated': amsterdamNow()
     };

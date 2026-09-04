@@ -53,7 +53,8 @@
             "TransferTrain": 27,
             "Updated": 24,
             "Vibrate": 64,
-            "VibrateAt": 65
+            "VibrateAt": 65,
+            "WarnCode": 75
         },
         "projectType": "native",
         "resources": {

@@ -9,7 +9,8 @@ typedef enum {
   KEY_T3_TIME = 52, KEY_T3_TRAIN = 53, KEY_T3_TRACK = 54, KEY_T3_DELAY = 55,
   KEY_SEL_TIME = 60, KEY_SEL_TRAIN = 61, KEY_CANCEL = 62,
   KEY_NEXT_ROUTE = 63, KEY_VIBRATE_AT = 65, KEY_ROUTE_LABEL = 70,
-  KEY_TIMELINE = 71, KEY_HEAD = 72, KEY_HEAD_STYLE = 73, KEY_LEG_IDX = 74
+  KEY_TIMELINE = 71, KEY_HEAD = 72, KEY_HEAD_STYLE = 73, KEY_LEG_IDX = 74,
+  KEY_WARN_CODE = 75
 } AppKey;
 
 #define MAX_TRIPS 4
@@ -18,6 +19,14 @@ typedef enum {
 #define TL_W 200
 #define ROW_H 18
 #define MAX_ROWS 28
+
+// snapshot (instant restore)
+#define SNAP_MAGIC      0x4E534D31   // "NSM1"
+#define SNAP_META_KEY   2
+#define SNAP_TL_KEY     3            // timeline chunks: keys 3..7
+#define SNAP_CHUNK      224
+#define SNAP_CHUNKS     5
+#define SNAP_MAX_AGE_S  (12 * 3600)
 
 static Window *s_menu_window, *s_card_window;
 static MenuLayer *s_menu;
@@ -43,6 +52,12 @@ static int  s_scrolled_row = -1;     // last row we auto-scrolled to
 static char s_head_buf[56];
 static char s_timeline_buf[1100];
 static char s_status_buf[36];
+
+// snapshot + warning state
+static bool s_card_cancelled = false;
+static bool s_restore_pending = false;
+static int32_t s_last_warn = 0;
+static time_t s_last_snap = 0;
 
 static int p_count = 0;
 static char p_time[MAX_TRIPS][8];
@@ -141,6 +156,7 @@ static void menu_click_config_provider(void *ctx) {
 
 // ---------- CARD BUTTONS ----------
 static void card_back_handler(ClickRecognizerRef ref, void *ctx) {
+  s_card_cancelled = true;   // tracking stops; drop the snapshot
   DictionaryIterator *iter;
   static int one = 1;
   if (app_message_outbox_begin(&iter) == APP_MSG_OK) {
@@ -150,7 +166,7 @@ static void card_back_handler(ClickRecognizerRef ref, void *ctx) {
   window_stack_pop(s_card_window);
 }
 static void card_long_select_handler(ClickRecognizerRef ref, void *ctx) {
-  window_stack_pop_all(true);   // exit; trip stays in lastTrip for restore
+  window_stack_pop_all(true);   // exit; card_unload saves the snapshot
 }
 static void card_click_config_provider(void *ctx) {
   window_single_click_subscribe(BUTTON_ID_BACK, card_back_handler);
@@ -241,7 +257,8 @@ static void tl_update_proc(Layer *layer, GContext *ctx) {
     if (is_warn)      { c = GColorRed; }
     else if (is_hdr)  { c = GColorBlue; f = s_tl_font_b; }
     else if (is_xfer) { c = s_tl_dim; }
-    else if (strstr(s_row_r[i], "->") || strstr(s_row_l[i], " +")) c = GColorOrange;
+    else if (strncmp(s_row_l[i], "Punctualiteit", 13) == 0) c = GColorGreen;
+    else if (strstr(s_row_r[i], ">") || strstr(s_row_l[i], " +")) c = GColorOrange;
 
     graphics_context_set_text_color(ctx, c);
     if (is_hdr) {
@@ -272,6 +289,79 @@ static void tl_update_proc(Layer *layer, GContext *ctx) {
   }
 }
 
+// ---------- SNAPSHOT (instant restore) ----------
+typedef struct {
+  uint32_t magic;
+  uint32_t epoch;
+  int32_t  warn;
+  char     head[56];
+  char     status[36];
+  char     label[24];
+  uint16_t tl_len;
+  uint8_t  chunks;
+} SnapMeta;
+
+static void snapshot_clear(void) {
+  for (int k = SNAP_META_KEY; k < SNAP_TL_KEY + SNAP_CHUNKS; k++)
+    persist_delete(k);
+  s_last_snap = 0;
+}
+
+static void snapshot_save(bool force) {
+  time_t now = time(NULL);
+  if (!force && s_last_snap != 0 && now - s_last_snap < 600) return; // max 1x/10min
+  size_t tl_len = strlen(s_timeline_buf) + 1;
+  if (tl_len > sizeof(s_timeline_buf)) tl_len = sizeof(s_timeline_buf);
+
+  SnapMeta m;
+  memset(&m, 0, sizeof(m));
+  m.magic = SNAP_MAGIC;
+  m.epoch = (uint32_t)now;
+  m.warn  = s_last_warn;
+  copy_str(m.head, sizeof(m.head), s_head_buf);
+  copy_str(m.status, sizeof(m.status), s_status_buf);
+  copy_str(m.label, sizeof(m.label), s_route_label);
+  m.tl_len = (uint16_t)tl_len;
+  m.chunks = (uint8_t)((tl_len + SNAP_CHUNK - 1) / SNAP_CHUNK);
+
+  if (persist_write_data(SNAP_META_KEY, &m, sizeof(m)) != S_TRUE) return;
+  for (uint8_t i = 0; i < m.chunks && i < SNAP_CHUNKS; i++) {
+    size_t off = i * SNAP_CHUNK;
+    size_t n = tl_len - off;
+    if (n > SNAP_CHUNK) n = SNAP_CHUNK;
+    if (persist_write_data(SNAP_TL_KEY + i, s_timeline_buf + off, n) != S_TRUE) return;
+  }
+  s_last_snap = now;
+}
+
+static bool snapshot_load(void) {
+  SnapMeta m;
+  if (persist_get_size(SNAP_META_KEY) != (int)sizeof(m)) return false;
+  if (persist_read_data(SNAP_META_KEY, &m, sizeof(m)) != (int)sizeof(m)) return false;
+  if (m.magic != SNAP_MAGIC) return false;
+  if ((time_t)m.epoch < time(NULL) - SNAP_MAX_AGE_S) { snapshot_clear(); return false; }
+
+  memset(s_timeline_buf, 0, sizeof(s_timeline_buf));
+  for (uint8_t i = 0; i < m.chunks && i < SNAP_CHUNKS; i++) {
+    size_t off = i * SNAP_CHUNK;
+    size_t cap = sizeof(s_timeline_buf) - off - 1;
+    size_t n = (m.tl_len - off > SNAP_CHUNK) ? SNAP_CHUNK : (m.tl_len - off);
+    if (n > cap) n = cap;
+    if (persist_read_data(SNAP_TL_KEY + i, s_timeline_buf + off, n) < 0) {
+      snapshot_clear();
+      return false;
+    }
+  }
+  s_timeline_buf[sizeof(s_timeline_buf) - 1] = 0;
+
+  copy_str(s_head_buf, sizeof(s_head_buf), m.head);
+  copy_str(s_status_buf, sizeof(s_status_buf), m.status);
+  copy_str(s_route_label, sizeof(s_route_label), m.label);
+  persist_write_string(1, s_route_label);
+  s_last_warn = m.warn;   // no re-buzz for a warning you already saw
+  return true;
+}
+
 // ---------- INBOX ----------
 static void inbox_received(DictionaryIterator *iter, void *ctx) {
   Tuple *type = dict_find(iter, KEY_MSG_TYPE);
@@ -279,7 +369,11 @@ static void inbox_received(DictionaryIterator *iter, void *ctx) {
   int32_t mt = type->value->int32;
 
   if (mt == 1) { // picker list
+    s_card_cancelled = true;   // this pop must not save a snapshot
     if (s_card_on_top) { window_stack_pop(s_card_window); }
+    s_card_cancelled = false;
+    snapshot_clear();
+    s_last_warn = 0;
     Tuple *rl = dict_find(iter, KEY_ROUTE_LABEL);
     if (rl) {
       copy_str(s_route_label, sizeof(s_route_label), rl->value->cstring);
@@ -346,6 +440,13 @@ static void inbox_received(DictionaryIterator *iter, void *ctx) {
       snprintf(s_status_buf, sizeof(s_status_buf), "Upd %s", upd->value->cstring);
       text_layer_set_text(s_status, s_status_buf);
     }
+    // warning vibration: buzz when a (new) warning appears
+    Tuple *wc = dict_find(iter, KEY_WARN_CODE);
+    int code = (wc && wc->type == TUPLE_INT) ? (int)wc->value->int32 : 0;
+    if (code != 0 && code != s_last_warn) vibes_double_pulse();
+    s_last_warn = code;
+    // keep a fresh snapshot on flash (rate-limited) in case the app dies
+    snapshot_save(false);
     Tuple *vat = dict_find(iter, KEY_VIBRATE_AT);
     if (vat && vat->type == TUPLE_INT) s_vibrate_at = vat->value->int32;
     check_vibrate(); // buzz immediately if the target already passed
@@ -435,11 +536,26 @@ static void card_load(Window *window) {
   });
   scroll_layer_set_click_config_onto_window(s_scroll, s_card_window);
   tick_timer_service_subscribe(MINUTE_UNIT, tick_handler);
+
+  // instant restore: paint the snapshot before the phone wakes up
+  if (s_restore_pending) {
+    s_restore_pending = false;
+    text_layer_set_text(s_title, s_route_label);
+    text_layer_set_text(s_head, s_head_buf);
+    text_layer_set_text(s_status, s_status_buf);
+    timeline_apply();
+  }
 }
 
 static void card_unload(Window *window) {
   s_card_on_top = false;
   tick_timer_service_unsubscribe();
+  if (s_card_cancelled) {
+    snapshot_clear();          // tracking stopped; nothing to restore
+  } else {
+    snapshot_save(true);       // exit with an active trip -> save for reopen
+  }
+  s_card_cancelled = false;
   text_layer_destroy(s_title);
   text_layer_destroy(s_clock);
   text_layer_destroy(s_head);
@@ -451,6 +567,7 @@ static void card_unload(Window *window) {
 static void init(void) {
   if (persist_read_string(1, s_route_label, sizeof(s_route_label)) == 0)
     snprintf(s_route_label, sizeof(s_route_label), "Route");
+  bool restore = snapshot_load();
   s_menu_window = window_create();
   window_set_window_handlers(s_menu_window, (WindowHandlers) {
     .load = menu_load, .unload = menu_unload });
@@ -461,6 +578,10 @@ static void init(void) {
   app_message_register_inbox_received(inbox_received);
   app_message_register_inbox_dropped(inbox_dropped);
   window_stack_push(s_menu_window, true);
+  if (restore) {
+    s_restore_pending = true;
+    window_stack_push(s_card_window, true);
+  }
 }
 
 static void deinit(void) {
